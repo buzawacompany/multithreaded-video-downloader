@@ -1,0 +1,144 @@
+BACKEND
+import json
+import os
+import threading
+import requests
+import time
+from flask import Flask, request, jsonify
+from flask_cors import CORS
+from pytube import YouTube
+
+app = Flask(__name__)
+CORS(app)
+
+DOWNLOAD_FOLDER = "downloads"
+HISTORY_FILE = "download_history.json"
+os.makedirs(DOWNLOAD_FOLDER, exist_ok=True)
+
+downloads = {}  # {url: {"progress": int, "file": str, "paused": bool, "threads": []}}
+
+# Load history
+def load_history():
+    if os.path.exists(HISTORY_FILE):
+        with open(HISTORY_FILE, "r") as f:
+            return json.load(f)
+    return []
+
+# Save history
+def save_history(history):
+    with open(HISTORY_FILE, "w") as f:
+        json.dump(history, f, indent=4)
+
+# Download video in chunks (multi-threaded)
+def download_chunk(url, file_path, start_byte, end_byte, chunk_index):
+    headers = {"Range": f"bytes={start_byte}-{end_byte}"}
+    response = requests.get(url, headers=headers, stream=True)
+
+    temp_file = f"{file_path}.part{chunk_index}"
+    with open(temp_file, "wb") as f:
+        for chunk in response.iter_content(chunk_size=1024):
+            while downloads[url]["paused"]:
+                time.sleep(1)  # Wait while paused
+            f.write(chunk)
+
+# Merge chunks into one file
+def merge_chunks(file_path, num_chunks):
+    with open(file_path, "wb") as final_file:
+        for i in range(num_chunks):
+            temp_file = f"{file_path}.part{i}"
+            with open(temp_file, "rb") as f:
+                final_file.write(f.read())
+            os.remove(temp_file)  # Clean up chunk file
+
+# Function to handle multi-threaded downloads
+def download_video(url):
+    try:
+        yt = YouTube(url)
+        stream = yt.streams.get_highest_resolution()
+        file_name = f"{yt.title}.mp4"
+        file_path = os.path.join(DOWNLOAD_FOLDER, file_name)
+
+        downloads[url] = {"progress": 0, "file": file_path, "paused": False, "threads": []}
+
+        # Get video file size
+        total_size = stream.filesize
+        chunk_size = total_size // 4  # Split into 4 chunks
+        threads = []
+
+        # Start multi-threaded download
+        for i in range(4):
+            start_byte = i * chunk_size
+            end_byte = (i + 1) * chunk_size - 1 if i < 3 else total_size - 1
+            thread = threading.Thread(target=download_chunk, args=(stream.url, file_path, start_byte, end_byte, i))
+            threads.append(thread)
+            thread.start()
+
+        downloads[url]["threads"] = threads
+
+        # Wait for all threads to finish
+        for thread in threads:
+            thread.join()
+
+        merge_chunks(file_path, 4)
+
+        # Save to history
+        history = load_history()
+        history.append({"title": yt.title, "url": url, "file": file_path})
+        save_history(history)
+
+        downloads[url]["progress"] = 100  # Mark as complete
+    except Exception as e:
+        downloads[url]["progress"] = -1  # Error
+        print(f"Error: {e}")
+
+# API to start download
+@app.route("/download", methods=["POST"])
+def start_download():
+    data = request.json
+    url = data.get("url")
+
+    if not url:
+        return jsonify({"error": "No URL provided"}), 400
+
+    if url in downloads and downloads[url]["progress"] < 100:
+        return jsonify({"message": "Download already in progress"}), 400
+
+    thread = threading.Thread(target=download_video, args=(url,))
+    downloads[url] = {"progress": 0, "file": "", "paused": False, "threads": []}
+    thread.start()
+
+    return jsonify({"message": "Download started", "url": url})
+
+# API to pause download
+@app.route("/pause", methods=["POST"])
+def pause_download():
+    url = request.json.get("url")
+    if url in downloads and downloads[url]["progress"] < 100:
+        downloads[url]["paused"] = True
+        return jsonify({"message": "Download paused"})
+    return jsonify({"error": "No active download found"}), 404
+
+# API to resume download
+@app.route("/resume", methods=["POST"])
+def resume_download():
+    url = request.json.get("url")
+    if url in downloads and downloads[url]["paused"]:
+        downloads[url]["paused"] = False
+        return jsonify({"message": "Download resumed"})
+    return jsonify({"error": "No paused download found"}), 404
+
+# API to check progress
+@app.route("/progress", methods=["GET"])
+def get_progress():
+    url = request.args.get("url")
+    if url in downloads:
+        return jsonify({"progress": downloads[url]["progress"], "paused": downloads[url]["paused"]})
+    return jsonify({"error": "No such download"}), 404
+
+# API to get download history
+@app.route("/history", methods=["GET"])
+def get_history():
+    return jsonify(load_history())
+
+if __name__ == "__main__":
+    app.run(debug=True, port=5000)
